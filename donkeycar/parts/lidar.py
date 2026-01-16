@@ -16,11 +16,16 @@ import numpy as np
 from donkeycar.utils import norm_deg, dist, deg2rad, arr_to_img
 from PIL import Image, ImageDraw
 
+import socket
+import struct
+
 logger = logging.getLogger("donkeycar.parts.lidar")
 
 CLOCKWISE = 1
 COUNTER_CLOCKWISE = -1
 
+
+HOST_PC_IP = ""
 
 def limit_angle(angle):
     """
@@ -61,7 +66,9 @@ class RPLidar2(object):
                  forward_angle = 0.0,
                  angle_direction=CLOCKWISE,
                  batch_ms=50,  # how long to loop in run()
-                 debug=False):
+                 debug=False,
+                 udp_host=None,
+                 udp_port=None):
         
         self.lidar = None
         self.port = None
@@ -96,7 +103,7 @@ class RPLidar2(object):
         self.min_distance = min_distance
         self.max_distance = max_distance
         self.forward_angle = forward_angle
-        self.spin_reverse = (args.angle_direction != CLOCKWISE)
+        self.spin_reverse = (angle_direction != CLOCKWISE)
         self.measurements = [] # list of (distance, angle, time, scan, index) 
 
         from adafruit_rplidar import RPLidar
@@ -134,6 +141,16 @@ class RPLidar2(object):
         self.measurement_batch_ms = batch_ms
 
         self.running = True
+
+        # UDP setup
+        if udp_host is not None and udp_port is not None:
+            self.udp_addr = (udp_host, udp_port)
+            self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            logger.info(f"RPLidar2 UDP sender enabled: {udp_host}:{udp_port}")
+        else:
+            self.udp_addr = None
+            self.udp_sock = None
+        
 
     def poll(self):
         if self.running:
@@ -234,6 +251,8 @@ class RPLidar2(object):
         logger.info("RPLidar rate = {rate} scans per second".format(rate=scan_rate))
         logger.info("RPLidar rate = {rate} measurements per second".format(rate=measurement_rate))
 
+        # logger.info("Last RPLidar scan: {scan}".format(scan=self.lidar))
+
     def run_threaded(self):
         if self.running:
             return self.measurements
@@ -252,6 +271,7 @@ class RPLidar2(object):
             time.sleep(0)  # yield time to other threads
             if time.time() >= batch_time:
                 break
+                
         return self.measurements
 
     def shutdown(self):
@@ -262,6 +282,11 @@ class RPLidar2(object):
             self.lidar.stop_motor()
             self.lidar.disconnect()
             self.lidar = None
+        
+        if self.udp_sock is not None:
+            self.udp_sock.close()
+            self.udp_sock = None
+            logger.info("RPLidar2 UDP socket closed")
 
 
 class RPLidar(object):
@@ -775,11 +800,19 @@ class ScanFilter(object):
         Smooths the measurements by spreading the nearest distance over a range of [spread] degrees.
     """
 
-    def __init__(self, min_angle, max_angle, measurement_spread=5, time_window=1.0):
+    def __init__(self, min_angle, max_angle, measurement_spread=5, time_window=1.0, udp_host=None, udp_port=None):
         self.min_angle = min_angle
         self.max_angle = max_angle
         self.time_window = time_window
         self.spread = measurement_spread
+
+        if udp_host and udp_port:
+            self.udp_addr = (udp_host, udp_port)
+            self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            logger.info(f"ScanFilter UDP sender enabled: {udp_host}:{udp_port}")
+        else:
+            self.udp_addr = None
+            self.udp_sock = None
 
     def run(self, measurements):
         if measurements == None:
@@ -789,7 +822,7 @@ class ScanFilter(object):
 
         # A measurement is a tuple of
         #    (distance, angle, time, scan, index).
-
+        
         now = time.time()
         valid_measurements = []
         # read through the lidar measurements one by one
@@ -813,7 +846,30 @@ class ScanFilter(object):
                 if a in smoothed:
                     smoothed[a] = min(smoothed[a], distance)
 
+        # for key, value in smoothed.items():
+        #     print(key, value)
+        # print("---------------------------------")
+
+        if self.udp_sock:
+            angles_list = list(smoothed.keys())
+            distances_list = [smoothed[a]/1000 for a in angles_list]
+            count = len(angles_list)
+            timestamp_ns = time.time_ns()
+            header = struct.pack("!IQH", 0, timestamp_ns, count)
+            payload = struct.pack(f"!{count}f{count}f", *angles_list, *distances_list)
+            packet = header + payload
+            try:
+                self.udp_sock.sendto(packet, self.udp_addr)
+            except Exception as e:
+                logger.error(f"UDP send error: {e}")
+        
         return smoothed
+
+    def shutdown(self):
+        if self.udp_sock:
+            self.udp_sock.close()
+            self.udp_sock = None
+            logger.info("ScanFilter UDP socket closed")    
 
 
 class LidarValidator(object):
@@ -827,16 +883,21 @@ class LidarValidator(object):
         self.timestamp = None
 
     def run(self, filtered_measurements):
-        if filtered_measurements is None:
+        if filtered_measurements == None:
             return
 
         if len(filtered_measurements) == 0:
             return
 
-        if self.previous_scan is None:
+
+        if self.previous_scan == None:
             self.previous_scan = filtered_measurements
             self.timestamp = time.time()
             return
+
+
+        inf_values = []
+        failed_tolerances = {}
 
         for angle, distance in filtered_measurements.items():
             if not math.isfinite(distance):
@@ -849,19 +910,33 @@ class LidarValidator(object):
                 self.variances[angle][1] = distance
             if self.variances[angle][2] < distance:
                 self.variances[angle][2] = distance
-
-
+            
+            
             if time.time() - self.timestamp > 120:
                 for key, value in self.variances.items():
                     print(key, ',', value[0], ',', value[1], ',', value[2])
-
+            
                 print()
+            
+            """
+            tolerance_distances = list(self.tolerances.keys())
+
+            tolerance = self.tolerances[tolerance_distances[-1]] * distance
+
+            for i in range(len(self.tolerances)-1):
+                if tolerance_distances[i] <= distance < tolerance_distances[i+1]:
+                    tolerance = self.tolerances[tolerance_distances[i]] * distance
+                    break
+            
+            if abs(distance - self.previous_scan[angle]) > tolerance:
+                failed_tolerances[angle] = distance - self.previous_scan[angle]
+            """
 
         self.previous_scan = filtered_measurements
 
         #logging.info("Infinite values at angles: " + str(inf_values))
         #logging.info("Failed tolerances at angles (given difference is): " + str(failed_tolerances))
-
+        
 class LidarVisualizer(object):
     """
         Prints the lidar scan to console as a bar graph
@@ -907,7 +982,7 @@ class LidarVisualizer(object):
         print("\n".join(rows + [label_line]))
 
 
-
+        
 
 if __name__ == "__main__":
     import argparse
