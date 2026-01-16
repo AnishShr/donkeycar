@@ -81,3 +81,24 @@ V.start(rate_hz=10)
 
 See [home page](http://donkeycar.com), [docs](http://docs.donkeycar.com)
 or join the [Discord server](http://www.donkeycar.com/community.html) to learn more.
+
+## Teleoperation
+In the `/home/pi` directory of the DonkeyCar (or the Raspberry Pi), create a new bash script called `donkey_drive.sh` with the following contents:   
+```
+#!/usr/bin/bash
+
+rm ~/mycar -r
+donkey createcar --template=donkey_drive
+python ~/mycar/manage.py drive
+
+```
+
+Make sure you have permissions to run this script:   
+`sudo chmod +x donkey_drive.sh`   
+
+Then, run the below command to teleoperate the DonkeyCar:   
+`./donkey_drive.sh`   
+
+The configuration parameters for the donkeycar is in the file: `/home/pi/donkeycar/donkeycar/templates/cfg_donkey_drive.py`   
+
+MAKE SURE YOU HAVE `cfg_donkey_drive.py` and `donkey_drive.py` files inside the `templates` directory
